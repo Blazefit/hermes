@@ -237,6 +237,16 @@ class HermesConfig:
         )
 
     @property
+    def forwarding_accounts(self) -> Set[str]:
+        """Known forwarding accounts — emails from these are auto-forwards.
+
+        The original sender should be extracted from the email body.
+        Configured in hermes.yaml under email.forwarding_accounts.
+        """
+        raw = self._raw.get("email", {}).get("forwarding_accounts", [])
+        return {addr.lower().strip() for addr in raw if addr}
+
+    @property
     def account_connection_map(self) -> Dict[str, str]:
         result: Dict[str, str] = {}
         for acct in self.email_accounts:

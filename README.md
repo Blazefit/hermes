@@ -189,6 +189,25 @@ hermes install-skill
 
 Then Claude Code can run `hermes cycle`, `hermes status`, etc. when you mention emails.
 
+## Forwarded Email Detection
+
+If you have emails auto-forwarded from another account (e.g., a virtual assistant, booking system notifications, or form submissions), Hermes can detect the original sender and reply to them directly instead of the forwarder.
+
+```yaml
+email:
+  forwarding_accounts:
+    - "assistant@mycompany.com"
+    - "notifications@mybookingsystem.com"
+```
+
+When an email arrives from a forwarding account, Hermes extracts the real sender using multiple patterns:
+1. **Booking systems** (Wodify, etc.) — Extracts from "Contact Info" + `mailto:` links
+2. **Form submissions** (Gravity Forms, WordPress) — Extracts from "Email:" fields
+3. **Gmail forwarded headers** — Parses `From: Name <email>` in the body
+4. **Fallback** — Finds any non-system email in the body
+
+System/noreply addresses (`noreply@`, `notifications@`, etc.) are automatically skipped during extraction.
+
 ## Safety
 
 - Configurable categories can require human review (billing by default)

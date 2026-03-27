@@ -1,36 +1,41 @@
 -- =============================================================================
 -- 003_hermes_functions.sql
--- Hermes Email System -- Advisory Lock & Maintenance Functions
+-- Hermes Email System — Utility Functions
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
--- Advisory Lock Helpers
--- Used to ensure only one processing cycle runs at a time.
+-- Get cycle stats for the last N hours
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION hermes_try_lock()
-RETURNS BOOLEAN
+CREATE OR REPLACE FUNCTION hermes_cycle_stats(hours_back INT DEFAULT 24)
+RETURNS TABLE (
+    total_drafts BIGINT,
+    pending_review BIGINT,
+    auto_sent BIGINT,
+    manually_sent BIGINT,
+    flagged BIGINT,
+    stale BIGINT
+)
 LANGUAGE sql
 SECURITY DEFINER
+STABLE
 AS $$
-    SELECT pg_try_advisory_lock(hashtext('hermes_email_cycle'));
-$$;
-
-CREATE OR REPLACE FUNCTION hermes_unlock()
-RETURNS BOOLEAN
-LANGUAGE sql
-SECURITY DEFINER
-AS $$
-    SELECT pg_advisory_unlock(hashtext('hermes_email_cycle'));
+    SELECT
+        COUNT(*)                                              AS total_drafts,
+        COUNT(*) FILTER (WHERE status = 'pending_review')     AS pending_review,
+        COUNT(*) FILTER (WHERE status = 'auto_sent')          AS auto_sent,
+        COUNT(*) FILTER (WHERE status = 'sent')               AS manually_sent,
+        COUNT(*) FILTER (WHERE flags::text != '[]')           AS flagged,
+        COUNT(*) FILTER (WHERE status = 'stale')              AS stale
+    FROM hermes_drafts
+    WHERE created_at >= now() - (hours_back || ' hours')::interval;
 $$;
 
 -- ---------------------------------------------------------------------------
--- Maintenance: Archive old drafts
--- Strips generation_context from drafts older than 90 days that are in a
--- terminal status (sent, auto_sent, discarded, stale). Returns row count.
+-- Purge old audit logs (keep last N days)
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION hermes_archive_old_drafts()
+CREATE OR REPLACE FUNCTION hermes_purge_audit_log(keep_days INT DEFAULT 180)
 RETURNS INT
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -38,11 +43,8 @@ AS $$
 DECLARE
     v_count INT;
 BEGIN
-    UPDATE hermes_drafts
-    SET    generation_context = NULL
-    WHERE  status IN ('sent', 'auto_sent', 'discarded', 'stale')
-      AND  created_at < now() - INTERVAL '90 days'
-      AND  generation_context IS NOT NULL;
+    DELETE FROM hermes_audit_log
+    WHERE created_at < now() - (keep_days || ' days')::interval;
 
     GET DIAGNOSTICS v_count = ROW_COUNT;
     RETURN v_count;

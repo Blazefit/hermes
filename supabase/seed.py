@@ -1,98 +1,99 @@
-"""Hermes database seeder.
+#!/usr/bin/env python3
+"""Dynamic seeder for Hermes.
 
-Reads hermes.yaml, inserts hermes_config rows for each category,
-and loads template anchor text from templates/{slug}.md into hermes_templates.
+Reads hermes.yaml and inserts config and template rows into Supabase
+so the database matches the YAML configuration.
+
+Usage:
+    python -m supabase.seed                # from project root
+    hermes seed                            # via CLI
 """
 
-from __future__ import annotations
-
+import logging
 import sys
-from pathlib import Path
+
+from hermes.config import HermesConfig
+
+logger = logging.getLogger(__name__)
 
 
-def seed(config_path: str = "hermes.yaml") -> None:
-    """Seed the Hermes database from hermes.yaml and template files.
+def seed_config(config: HermesConfig) -> dict:
+    """Insert or update hermes_config and hermes_templates rows.
 
     Args:
-        config_path: Path to hermes.yaml config file.
+        config: Loaded HermesConfig.
+
+    Returns:
+        Dict with counts: {upserted_config, upserted_templates}.
     """
-    from hermes.config import HermesConfig
+    sb = config.get_supabase()
+    counts = {"upserted_config": 0, "upserted_templates": 0}
 
-    cfg = HermesConfig(config_path=config_path)
-
-    if not cfg.supabase_url or not cfg.supabase_service_key:
-        print("ERROR: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set.")
-        sys.exit(1)
-
-    sb = cfg.get_supabase()
-    tpl_dir = cfg.templates_dir
-
-    print(f"Seeding Hermes database from: {config_path}")
-    print(f"Supabase URL: {cfg.supabase_url}")
-    print(f"Categories: {list(cfg.categories.keys())}")
-    print(f"Templates dir: {tpl_dir}")
-    print()
-
-    # -----------------------------------------------------------------------
-    # Seed hermes_config -- one row per category
-    # -----------------------------------------------------------------------
-    config_count = 0
-    for slug, cat in cfg.categories.items():
+    # Seed hermes_config — one row per category
+    for name, cat_cfg in config.categories.items():
         row = {
-            "category": slug,
-            "auto_send_enabled": cat.get("auto_send", False),
-            "auto_send_locked": cat.get("auto_send_locked", False),
-            "min_confidence_for_auto": cat.get("min_confidence", 0.9),
-            "reply_from_account": cfg.reply_from_account,
+            "category": name,
+            "auto_send_enabled": cat_cfg.get("auto_send", False),
+            "auto_send_locked": cat_cfg.get("auto_send_locked", False),
+            "min_confidence_for_auto": cat_cfg.get("min_confidence", 0.9),
+            "reply_from_account": config.reply_from_account,
         }
         try:
-            sb.table("hermes_config").upsert(
-                row, on_conflict="category"
-            ).execute()
-            config_count += 1
-            auto_label = "auto-send ON" if cat.get("auto_send") else "manual"
-            locked_label = " (LOCKED)" if cat.get("auto_send_locked") else ""
-            print(f"  [config] {slug}: {auto_label}{locked_label}")
+            sb.table("hermes_config").upsert(row, on_conflict="category").execute()
+            counts["upserted_config"] += 1
+            logger.info("Seeded config for category: %s", name)
         except Exception as exc:
-            print(f"  [config] ERROR inserting {slug}: {exc}")
+            logger.error("Failed to seed config for %s: %s", name, exc)
 
-    print(f"\nInserted/updated {config_count} hermes_config rows.")
+    # Seed hermes_templates — one row per category with anchor text from file
+    templates_dir = config.templates_dir
+    for name in config.categories:
+        template_file = templates_dir / f"{name}.md"
+        anchor_text = ""
+        if template_file.exists():
+            try:
+                anchor_text = template_file.read_text(encoding="utf-8")
+            except OSError as exc:
+                logger.warning("Failed to read template %s: %s", template_file, exc)
 
-    # -----------------------------------------------------------------------
-    # Seed hermes_templates -- one row per category with anchor text from .md
-    # -----------------------------------------------------------------------
-    template_count = 0
-    for slug in cfg.categories:
-        template_file = tpl_dir / f"{slug}.md"
-        if not template_file.exists():
-            print(f"  [template] SKIP {slug} -- no file at {template_file}")
-            continue
-
-        anchor_text = template_file.read_text(encoding="utf-8").strip()
         if not anchor_text:
-            print(f"  [template] SKIP {slug} -- empty template file")
-            continue
+            anchor_text = f"Default template for {name.replace('_', ' ')} emails."
 
         row = {
-            "category": slug,
+            "category": name,
             "anchor_text": anchor_text,
         }
         try:
             sb.table("hermes_templates").upsert(
                 row, on_conflict="category"
             ).execute()
-            template_count += 1
-            print(
-                f"  [template] {slug}: "
-                f"{len(anchor_text)} chars from {template_file.name}"
-            )
+            counts["upserted_templates"] += 1
+            logger.info("Seeded template for category: %s", name)
         except Exception as exc:
-            print(f"  [template] ERROR inserting {slug}: {exc}")
+            logger.error("Failed to seed template for %s: %s", name, exc)
 
-    print(f"\nInserted/updated {template_count} hermes_templates rows.")
-    print("\nSeed complete.")
+    return counts
+
+
+def main():
+    """CLI entry point for seeding."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    try:
+        config = HermesConfig()
+    except Exception as exc:
+        print(f"Error loading config: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Seeding database for {config.business_name}...")
+    print(f"Categories: {sorted(config.category_names)}")
+
+    counts = seed_config(config)
+
+    print(f"\nDone:")
+    print(f"  Config rows upserted:   {counts['upserted_config']}")
+    print(f"  Template rows upserted: {counts['upserted_templates']}")
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "hermes.yaml"
-    seed(path)
+    main()

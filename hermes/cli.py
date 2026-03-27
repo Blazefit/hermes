@@ -1,440 +1,339 @@
-"""Hermes CLI -- command-line interface for the Hermes email system.
+"""Hermes Email CLI.
 
-Usage:
-    hermes setup          Interactive setup wizard
-    hermes cycle          Run one email processing cycle
-    hermes status         Show inbox counts per account
-    hermes train          Run voice sample training
-    hermes drafts         List pending drafts
-    hermes migrate        Run SQL migrations against Supabase
-    hermes seed           Seed database from config + templates
-    hermes install-skill  Install the Claude Code skill file
+Commands:
+    setup       — Interactive setup wizard
+    cycle       — Run one email processing cycle
+    status      — Show system status and draft counts
+    train       — Pull historical emails and build voice samples
+    drafts      — List pending drafts
+    migrate     — Show migration instructions
+    seed        — Seed database from hermes.yaml
+    install-skill — Install the Claude Code skill
 """
 
-from __future__ import annotations
-
 import json
-import os
-import shutil
+import logging
 import sys
-from pathlib import Path
 
 import click
-from dotenv import load_dotenv
+
+from hermes import __version__
 
 
-def _load_config(config_path: str):
-    """Load HermesConfig, handling missing file gracefully."""
+def _load_config():
+    """Lazy-load config to avoid import errors before setup."""
     from hermes.config import HermesConfig
+    return HermesConfig()
 
-    try:
-        return HermesConfig(config_path=config_path)
-    except FileNotFoundError:
-        click.echo(f"Config file not found: {config_path}")
-        click.echo("Run 'hermes setup' to create one.")
-        sys.exit(1)
-    except ValueError as exc:
-        click.echo(f"Config error: {exc}")
-        sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# CLI group
-# ---------------------------------------------------------------------------
 
 @click.group()
-@click.option(
-    "--config", "-c",
-    default="hermes.yaml",
-    envvar="HERMES_CONFIG",
-    help="Path to hermes.yaml (default: ./hermes.yaml)",
-)
-@click.pass_context
-def cli(ctx: click.Context, config: str) -> None:
-    """Hermes -- AI-powered email processing system."""
-    ctx.ensure_object(dict)
-    ctx.obj["config_path"] = config
+@click.version_option(__version__, prog_name="hermes")
+def main():
+    """Hermes Email — AI-powered email automation pipeline."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 # ---------------------------------------------------------------------------
-# hermes setup
+# setup
 # ---------------------------------------------------------------------------
 
-@cli.command()
-@click.pass_context
-def setup(ctx: click.Context) -> None:
+@main.command()
+def setup():
     """Run the interactive setup wizard."""
     from hermes.wizard.setup import run_setup_wizard
-
-    run_setup_wizard(ctx.obj["config_path"])
+    run_setup_wizard()
 
 
 # ---------------------------------------------------------------------------
-# hermes cycle
+# cycle
 # ---------------------------------------------------------------------------
 
-@cli.command()
-@click.pass_context
-def cycle(ctx: click.Context) -> None:
-    """Run one email processing cycle (fetch + classify + draft)."""
-    config_path = ctx.obj["config_path"]
+@main.command()
+@click.option("--dry-run", is_flag=True, help="Fetch and classify only — no generation or sending.")
+def cycle(dry_run):
+    """Run one email processing cycle."""
+    config = _load_config()
 
-    try:
-        from hermes.pipeline.cycle import run_cycle
-    except ImportError:
-        click.echo("ERROR: hermes.pipeline.cycle not yet implemented.")
-        click.echo("The processing pipeline module is required for this command.")
-        sys.exit(1)
+    if dry_run:
+        click.echo("Dry run mode: fetch + classify only")
+        from hermes.providers import get_email_provider, get_ai_provider
+        from hermes.pipeline.fetch import fetch_new_emails
+        from hermes.pipeline.classify import classify_email
 
-    click.echo("Starting processing cycle...")
-    result = run_cycle(config_path=config_path)
+        email_provider = get_email_provider(config)
+        cls_provider = get_ai_provider(config, role="classifier")
+
+        emails = fetch_new_emails(config, email_provider)
+        click.echo(f"Fetched {len(emails)} new emails")
+
+        for email in emails[:config.max_emails_per_cycle]:
+            result = classify_email(
+                email.get("subject", ""),
+                email.get("body", ""),
+                config, cls_provider,
+            )
+            click.echo(
+                f"  [{result['category']}] "
+                f"confidence={result['confidence']:.2f} "
+                f"method={result['method']} "
+                f"subject={email.get('subject', '')[:60]}"
+            )
+        return
+
+    from hermes.pipeline.cycle import run_cycle
+
+    result = run_cycle(config)
     click.echo(json.dumps(result, indent=2, default=str))
+
     if result.get("status") == "error":
         sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
-# hermes status
+# status
 # ---------------------------------------------------------------------------
 
-@cli.command()
-@click.pass_context
-def status(ctx: click.Context) -> None:
-    """Show inbox status -- draft counts by status and category."""
-    config_path = ctx.obj["config_path"]
-    cfg = _load_config(config_path)
-    sb = cfg.get_supabase()
+@main.command()
+@click.option("--hours", default=24, help="Look back N hours for stats.")
+def status(hours):
+    """Show system status and draft counts."""
+    config = _load_config()
+    sb = config.get_supabase()
 
-    click.echo("Hermes Status")
-    click.echo("=" * 50)
+    click.echo(f"Hermes Email v{__version__}")
+    click.echo(f"Business: {config.business_name}")
+    click.echo(f"Accounts: {[a.get('address') for a in config.email_accounts]}")
+    click.echo(f"Categories: {sorted(config.category_names)}")
+    click.echo()
 
-    # Draft counts by status
-    click.echo("\nDrafts by status:")
-    for status_val in [
-        "pending_review", "approved", "sent", "auto_sent", "discarded", "stale"
-    ]:
-        try:
-            resp = (
-                sb.table("hermes_drafts")
-                .select("id", count="exact")
-                .eq("status", status_val)
-                .execute()
-            )
-            count = resp.count if resp.count is not None else len(resp.data or [])
-            if count > 0:
-                click.echo(f"  {status_val:20s}  {count}")
-        except Exception as exc:
-            click.echo(f"  {status_val:20s}  ERROR: {exc}")
-
-    # Draft counts by category
-    click.echo("\nDrafts by category (pending_review):")
-    for slug in cfg.categories:
-        try:
-            resp = (
-                sb.table("hermes_drafts")
-                .select("id", count="exact")
-                .eq("status", "pending_review")
-                .eq("category", slug)
-                .execute()
-            )
-            count = resp.count if resp.count is not None else len(resp.data or [])
-            if count > 0:
-                click.echo(f"  {slug:20s}  {count}")
-        except Exception as exc:
-            click.echo(f"  {slug:20s}  ERROR: {exc}")
-
-    # Config last processed
-    click.echo("\nLast processed:")
     try:
-        resp = (
+        stats = sb.rpc("hermes_cycle_stats", {"hours_back": hours}).execute()
+        if stats.data:
+            row = stats.data[0] if isinstance(stats.data, list) else stats.data
+            click.echo(f"Draft stats (last {hours}h):")
+            click.echo(f"  Total:          {row.get('total_drafts', 0)}")
+            click.echo(f"  Pending review: {row.get('pending_review', 0)}")
+            click.echo(f"  Auto-sent:      {row.get('auto_sent', 0)}")
+            click.echo(f"  Manually sent:  {row.get('manually_sent', 0)}")
+            click.echo(f"  Flagged:        {row.get('flagged', 0)}")
+            click.echo(f"  Stale:          {row.get('stale', 0)}")
+    except Exception as exc:
+        click.echo(f"Could not fetch stats: {exc}")
+
+    try:
+        cfg_resp = (
             sb.table("hermes_config")
-            .select("category, last_processed_at, auto_send_enabled")
+            .select("category, auto_send_enabled, last_processed_at")
             .execute()
         )
-        for row in resp.data or []:
-            cat = row.get("category", "?")
-            lp = row.get("last_processed_at", "never")
-            auto = "auto" if row.get("auto_send_enabled") else "manual"
-            click.echo(f"  {cat:20s}  {lp or 'never':30s}  [{auto}]")
-    except Exception as exc:
-        click.echo(f"  ERROR: {exc}")
-
-    # Email accounts
-    click.echo(f"\nAccounts: {len(cfg.email_accounts)}")
-    for acct in cfg.email_accounts:
-        addr = acct.get("address", "?")
-        role = acct.get("role", "?")
-        click.echo(f"  {addr} ({role})")
-
-    click.echo(f"\nReply-from: {cfg.reply_from_account}")
-
-
-# ---------------------------------------------------------------------------
-# hermes train
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.pass_context
-def train(ctx: click.Context) -> None:
-    """Run voice sample training from sent email history."""
-    config_path = ctx.obj["config_path"]
-
-    try:
-        from hermes.pipeline.train import run_training
-    except ImportError:
-        click.echo("ERROR: hermes.pipeline.train not yet implemented.")
-        sys.exit(1)
-
-    click.echo("Starting voice training...")
-    result = run_training(config_path=config_path)
-    click.echo(json.dumps(result, indent=2, default=str))
-
-
-# ---------------------------------------------------------------------------
-# hermes drafts
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option(
-    "--status", "-s",
-    "draft_status",
-    default="pending_review",
-    help="Filter by draft status (default: pending_review)",
-)
-@click.option("--limit", "-n", default=20, help="Max drafts to show (default: 20)")
-@click.pass_context
-def drafts(ctx: click.Context, draft_status: str, limit: int) -> None:
-    """List drafts from Supabase, filtered by status."""
-    config_path = ctx.obj["config_path"]
-    cfg = _load_config(config_path)
-    sb = cfg.get_supabase()
-
-    try:
-        query = (
-            sb.table("hermes_drafts")
-            .select(
-                "id, sender_email, sender_name, subject, category, "
-                "classification_confidence, status, created_at"
-            )
-            .eq("status", draft_status)
-            .order("created_at", desc=True)
-            .limit(limit)
-        )
-        resp = query.execute()
-    except Exception as exc:
-        click.echo(f"ERROR querying drafts: {exc}")
-        sys.exit(1)
-
-    rows = resp.data or []
-    if not rows:
-        click.echo(f"No drafts with status '{draft_status}'.")
-        return
-
-    click.echo(f"Drafts ({draft_status}) -- {len(rows)} found:")
-    click.echo("-" * 80)
-    for row in rows:
-        sender = row.get("sender_name") or row.get("sender_email", "?")
-        subj = (row.get("subject") or "(no subject)")[:50]
-        cat = row.get("category", "?")
-        conf = row.get("classification_confidence", 0) or 0
-        created = (row.get("created_at") or "")[:19]
-        draft_id = (row.get("id") or "")[:8]
-        click.echo(
-            f"  [{draft_id}] {sender:25s}  {cat:15s}  "
-            f"{conf:.0%}  {created}  {subj}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# hermes migrate
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--dry-run", is_flag=True, help="Print SQL without executing")
-@click.pass_context
-def migrate(ctx: click.Context, dry_run: bool) -> None:
-    """Run SQL migrations from supabase/migrations/ against the database."""
-    config_path = ctx.obj["config_path"]
-    cfg = _load_config(config_path)
-
-    # Find migration files: look relative to the package, then relative to config
-    migrations_dir = Path(__file__).resolve().parent.parent / "supabase" / "migrations"
-    if not migrations_dir.exists():
-        migrations_dir = cfg.project_root / "supabase" / "migrations"
-    if not migrations_dir.exists():
-        click.echo(f"No migrations directory found at {migrations_dir}")
-        sys.exit(1)
-
-    sql_files = sorted(migrations_dir.glob("*.sql"))
-    if not sql_files:
-        click.echo("No .sql files found in migrations directory.")
-        return
-
-    click.echo(f"Found {len(sql_files)} migration(s) in {migrations_dir}:")
-    for f in sql_files:
-        click.echo(f"  {f.name}")
-
-    if dry_run:
-        click.echo("\n--dry-run: printing SQL without executing.\n")
-        for f in sql_files:
-            click.echo(f"-- === {f.name} ===")
-            click.echo(f.read_text(encoding="utf-8"))
+        if cfg_resp.data:
             click.echo()
-        return
+            click.echo("Category config:")
+            for row in cfg_resp.data:
+                auto = "ON" if row.get("auto_send_enabled") else "off"
+                last = row.get("last_processed_at", "never")
+                click.echo(
+                    f"  {row['category']:20s}  auto_send={auto:3s}  last_run={last}"
+                )
+    except Exception as exc:
+        click.echo(f"Could not fetch config: {exc}")
 
-    # Execute via psycopg2 if DATABASE_URL is set, otherwise via Supabase REST RPC
-    database_url = os.environ.get("DATABASE_URL", "")
 
-    if database_url:
-        _migrate_psycopg2(database_url, sql_files)
-    else:
-        _migrate_supabase_rest(cfg, sql_files)
+# ---------------------------------------------------------------------------
+# train
+# ---------------------------------------------------------------------------
 
+@main.command()
+@click.option("--days", default=90, help="Days back to search for training data.")
+def train(days):
+    """Pull historical sent emails and build voice samples."""
+    config = _load_config()
+    from hermes.providers import get_email_provider
 
-def _migrate_psycopg2(database_url: str, sql_files: list) -> None:
-    """Execute migrations via direct PostgreSQL connection."""
+    email_provider = get_email_provider(config)
+    sb = config.get_supabase()
+
+    click.echo(f"Training pipeline (last {days} days)...")
+
+    for category, cat_cfg in config.categories.items():
+        patterns = cat_cfg.get("patterns", [])
+        if not patterns:
+            continue
+
+        pattern_terms = " OR ".join(
+            p.replace("\\s+", " ").replace("\\s", " ").replace("\\b", "")
+            for p in patterns[:5]
+        )
+        query = f"subject:({pattern_terms}) in:sent newer_than:{days}d"
+
+        click.echo(f"  Searching {category}...")
+        samples = []
+        for acct in config.email_accounts:
+            address = acct.get("address", "")
+            try:
+                messages = email_provider.fetch_messages(
+                    address, max_results=50, query=query
+                )
+                for msg in messages:
+                    body = (msg.get("body") or "").strip()
+                    if 50 <= len(body) <= 3000:
+                        samples.append(body)
+            except Exception as exc:
+                click.echo(f"    Warning: {address}: {exc}")
+
+        kept = samples[:10]
+        click.echo(f"    Found {len(samples)} samples, keeping {len(kept)}")
+
+        if kept:
+            try:
+                sb.table("hermes_templates").update(
+                    {"voice_samples": kept}
+                ).eq("category", category).execute()
+            except Exception as exc:
+                click.echo(f"    Error saving: {exc}")
+
+    from datetime import datetime, timezone
+
+    now_iso = datetime.now(timezone.utc).isoformat()
     try:
-        import psycopg2
-    except ImportError:
-        click.echo("ERROR: psycopg2 not installed. Run: pip install psycopg2-binary")
-        click.echo("Or set DATABASE_URL to use direct connection.")
-        sys.exit(1)
+        sb.table("hermes_config").update(
+            {"last_trained_at": now_iso}
+        ).neq("id", "").execute()
+    except Exception:
+        pass
 
-    click.echo("\nConnecting via DATABASE_URL...")
-    conn = psycopg2.connect(database_url)
-    conn.autocommit = True
-
-    for f in sql_files:
-        sql = f.read_text(encoding="utf-8")
-        click.echo(f"\nRunning {f.name}...")
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-            click.echo(f"  OK")
-        except Exception as exc:
-            click.echo(f"  ERROR: {exc}")
-
-    conn.close()
-    click.echo("\nMigrations complete.")
+    click.echo("Training complete.")
 
 
-def _migrate_supabase_rest(cfg, sql_files: list) -> None:
-    """Execute migrations via Supabase SQL RPC.
+# ---------------------------------------------------------------------------
+# drafts
+# ---------------------------------------------------------------------------
 
-    Requires a custom 'hermes_exec_sql' function in the database.
-    Falls back to suggesting psycopg2 if unavailable.
-    """
-    sb = cfg.get_supabase()
+@main.command()
+@click.option(
+    "--status-filter", "status_filter", default="pending_review",
+    help="Filter by status (pending_review, sent, auto_sent, stale, all).",
+)
+@click.option("--limit", default=20, help="Max drafts to show.")
+def drafts(status_filter, limit):
+    """List drafts from the database."""
+    config = _load_config()
+    sb = config.get_supabase()
 
-    click.echo("\nRunning migrations via Supabase RPC...")
-    click.echo(
-        "NOTE: Requires a 'hermes_exec_sql' RPC function or "
-        "DATABASE_URL for direct DB access."
+    query = (
+        sb.table("hermes_drafts")
+        .select(
+            "id, sender_email, sender_name, subject, category, status, "
+            "classification_confidence, created_at"
+        )
+        .order("created_at", desc=True)
+        .limit(limit)
     )
 
-    for f in sql_files:
-        sql = f.read_text(encoding="utf-8")
-        click.echo(f"\nRunning {f.name}...")
-        try:
-            sb.rpc("hermes_exec_sql", {"sql_text": sql}).execute()
-            click.echo(f"  OK")
-        except Exception as exc:
-            error_msg = str(exc)
-            if "hermes_exec_sql" in error_msg or "function" in error_msg.lower():
-                click.echo(
-                    f"  SKIP: RPC function not available. "
-                    f"Set DATABASE_URL in .env and re-run."
-                )
-                return
-            click.echo(f"  ERROR: {exc}")
+    if status_filter != "all":
+        query = query.eq("status", status_filter)
 
-    click.echo("\nMigrations complete.")
+    resp = query.execute()
+    rows = resp.data or []
 
+    if not rows:
+        click.echo(f"No drafts found (status={status_filter})")
+        return
 
-# ---------------------------------------------------------------------------
-# hermes seed
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.pass_context
-def seed(ctx: click.Context) -> None:
-    """Seed the database from hermes.yaml and template files."""
-    config_path = ctx.obj["config_path"]
-    cfg = _load_config(config_path)
-    sb = cfg.get_supabase()
-    tpl_dir = cfg.templates_dir
-
-    click.echo(f"Seeding from: {config_path}")
-
-    config_count = 0
-    for slug, cat in cfg.categories.items():
-        row = {
-            "category": slug,
-            "auto_send_enabled": cat.get("auto_send", False),
-            "auto_send_locked": cat.get("auto_send_locked", False),
-            "min_confidence_for_auto": cat.get("min_confidence", 0.9),
-            "reply_from_account": cfg.reply_from_account,
-        }
-        try:
-            sb.table("hermes_config").upsert(row, on_conflict="category").execute()
-            config_count += 1
-            click.echo(f"  [config] {slug}")
-        except Exception as exc:
-            click.echo(f"  [config] ERROR {slug}: {exc}")
-
-    click.echo(f"  {config_count} config rows upserted.")
-
-    template_count = 0
-    for slug in cfg.categories:
-        tpl_file = tpl_dir / f"{slug}.md"
-        if not tpl_file.exists():
-            click.echo(f"  [template] SKIP {slug}")
-            continue
-        anchor = tpl_file.read_text(encoding="utf-8").strip()
-        if not anchor:
-            continue
-        row = {"category": slug, "anchor_text": anchor}
-        try:
-            sb.table("hermes_templates").upsert(
-                row, on_conflict="category"
-            ).execute()
-            template_count += 1
-            click.echo(f"  [template] {slug} ({len(anchor)} chars)")
-        except Exception as exc:
-            click.echo(f"  [template] ERROR {slug}: {exc}")
-
-    click.echo(f"  {template_count} template rows upserted.")
-    click.echo("Seed complete.")
+    click.echo(f"Drafts ({status_filter}, showing {len(rows)}):\n")
+    for row in rows:
+        conf = row.get("classification_confidence") or 0.0
+        name_or_email = (row.get("sender_name") or row.get("sender_email", ""))[:25]
+        subj = (row.get("subject") or "")[:40]
+        click.echo(
+            f"  [{row['status']:15s}] {row['category']:15s} "
+            f"conf={conf:.2f}  {name_or_email:25s}  {subj}"
+        )
+        click.echo(f"    id={row['id']}  created={row.get('created_at', '')}")
 
 
 # ---------------------------------------------------------------------------
-# hermes install-skill
+# migrate
 # ---------------------------------------------------------------------------
 
-@cli.command("install-skill")
-@click.pass_context
-def install_skill(ctx: click.Context) -> None:
-    """Install the Hermes skill file to ~/.claude/skills/hermes/."""
-    skill_src = Path(__file__).resolve().parent.parent / "skill" / "skill.md"
-    if not skill_src.exists():
-        click.echo(f"Skill file not found: {skill_src}")
+@main.command()
+def migrate():
+    """Show database migration instructions."""
+    click.echo("Hermes Database Migrations")
+    click.echo("=" * 40)
+    click.echo()
+    click.echo("Run these SQL files in order against your Supabase database:")
+    click.echo()
+    click.echo("  1. supabase/migrations/001_hermes_tables.sql")
+    click.echo("  2. supabase/migrations/002_hermes_rls.sql")
+    click.echo("  3. supabase/migrations/003_hermes_functions.sql")
+    click.echo("  4. supabase/migrations/004_hermes_blacklist.sql")
+    click.echo()
+    click.echo("After migrations, run: hermes seed")
+
+
+# ---------------------------------------------------------------------------
+# seed
+# ---------------------------------------------------------------------------
+
+@main.command()
+def seed():
+    """Seed the database from hermes.yaml."""
+    config = _load_config()
+
+    # Import from the supabase/seed.py module
+    import importlib.util
+    from pathlib import Path
+
+    seed_path = config.project_root / "supabase" / "seed.py"
+    if not seed_path.exists():
+        click.echo(f"Seed script not found: {seed_path}")
         sys.exit(1)
 
-    dest_dir = Path.home() / ".claude" / "skills" / "hermes"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_file = dest_dir / "skill.md"
+    spec = importlib.util.spec_from_file_location("seed_module", seed_path)
+    seed_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(seed_mod)
 
-    shutil.copy2(skill_src, dest_file)
-    click.echo(f"Installed skill to: {dest_file}")
+    click.echo(f"Seeding database for {config.business_name}...")
+    counts = seed_mod.seed_config(config)
+    click.echo(f"  Config rows:   {counts['upserted_config']}")
+    click.echo(f"  Template rows: {counts['upserted_templates']}")
+    click.echo("Done.")
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# install-skill
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    """Entry point for the hermes CLI."""
-    cli()
+@main.command("install-skill")
+@click.option("--target", default=None, help="Target directory for skill files.")
+def install_skill(target):
+    """Install the Hermes Claude Code skill."""
+    import shutil
+    from pathlib import Path
+
+    if target:
+        target_dir = Path(target)
+    else:
+        target_dir = Path.home() / ".claude" / "skills" / "hermes"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    skill_src = Path(__file__).parent.parent / "skill"
+    if not skill_src.exists():
+        click.echo(f"Skill source directory not found: {skill_src}")
+        sys.exit(1)
+
+    for src_file in skill_src.iterdir():
+        if src_file.is_file():
+            dest = target_dir / src_file.name
+            shutil.copy2(src_file, dest)
+            click.echo(f"  Copied {src_file.name} -> {dest}")
+
+    click.echo(f"\nSkill installed to {target_dir}")
 
 
 if __name__ == "__main__":

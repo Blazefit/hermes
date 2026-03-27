@@ -218,21 +218,33 @@ def _process_single_email(
     body = email.get("body", "")
     from_header = email.get("from_email", "")
 
-    # Handle forwarded emails
-    if is_forwarded(subject):
-        subject = strip_forward_prefix(subject)
-        sender_email = extract_original_sender(from_header, body)
+    # Extract bare email from From header for forwarding account check
+    from_email_match = _email_re.search(from_header)
+    from_bare_email = (
+        from_email_match.group(1).lower() if from_email_match else from_header.lower().strip()
+    )
+
+    # Detect forwarded emails — check BOTH subject prefix AND known forwarding accounts
+    has_fwd_prefix = is_forwarded(subject)
+    is_from_forwarder = from_bare_email in config.forwarding_accounts
+    _is_forwarded = has_fwd_prefix or is_from_forwarder
+
+    if _is_forwarded:
+        if has_fwd_prefix:
+            subject = strip_forward_prefix(subject)
+        sender_email = extract_original_sender(
+            from_header, body, config.forwarding_accounts
+        )
         original_name = extract_original_sender_name(body)
         sender_name = original_name or extract_sender_name(from_header)
         logger.info(
-            "Forwarded email (id=%s): resolved sender=%s <%s>",
-            gmail_message_id, sender_name, sender_email,
+            "Forwarded email (id=%s, method=%s): resolved sender=%s <%s>",
+            gmail_message_id,
+            "fwd_prefix" if has_fwd_prefix else "known_forwarder",
+            sender_name, sender_email,
         )
     else:
-        email_match = _email_re.search(from_header)
-        sender_email = (
-            email_match.group(1).lower() if email_match else from_header.lower().strip()
-        )
+        sender_email = from_bare_email
         sender_name = extract_sender_name(from_header)
 
     # Check for existing thread (follow-up detection)

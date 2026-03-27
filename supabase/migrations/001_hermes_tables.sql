@@ -1,43 +1,38 @@
 -- =============================================================================
 -- 001_hermes_tables.sql
--- Hermes Email System -- Core Schema (Generic)
+-- Hermes Email System — Core Schema (Generic)
+-- Categories use TEXT instead of ENUM for user-defined flexibility.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
--- Enums (universal status/action types only -- categories are TEXT)
+-- Enums (status and action only — categories are free-form TEXT)
 -- ---------------------------------------------------------------------------
 
-DO $$ BEGIN
-    CREATE TYPE hermes_draft_status AS ENUM (
-        'pending_review',
-        'approved',
-        'sent',
-        'auto_sent',
-        'discarded',
-        'stale'
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
+CREATE TYPE hermes_draft_status AS ENUM (
+    'pending_review',
+    'approved',
+    'sent',
+    'auto_sent',
+    'discarded',
+    'stale'
+);
 
-DO $$ BEGIN
-    CREATE TYPE hermes_audit_action AS ENUM (
-        'generated',
-        'regenerated',
-        'edited',
-        'sent',
-        'auto_sent',
-        'discarded',
-        'fetch_failed',
-        'cycle_skipped'
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
+CREATE TYPE hermes_audit_action AS ENUM (
+    'generated',
+    'regenerated',
+    'edited',
+    'sent',
+    'auto_sent',
+    'discarded',
+    'fetch_failed',
+    'cycle_skipped'
+);
 
 -- ---------------------------------------------------------------------------
 -- Tables
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS hermes_templates (
+CREATE TABLE hermes_templates (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     category            TEXT NOT NULL UNIQUE,
     anchor_text         TEXT NOT NULL,
@@ -47,7 +42,7 @@ CREATE TABLE IF NOT EXISTS hermes_templates (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS hermes_drafts (
+CREATE TABLE hermes_drafts (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     gmail_account               TEXT NOT NULL,
     gmail_message_id            TEXT NOT NULL,
@@ -72,7 +67,7 @@ CREATE TABLE IF NOT EXISTS hermes_drafts (
     UNIQUE (gmail_message_id, gmail_account)
 );
 
-CREATE TABLE IF NOT EXISTS hermes_config (
+CREATE TABLE hermes_config (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     category                    TEXT NOT NULL UNIQUE,
     auto_send_enabled           BOOLEAN NOT NULL DEFAULT false,
@@ -84,7 +79,7 @@ CREATE TABLE IF NOT EXISTS hermes_config (
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS hermes_audit_log (
+CREATE TABLE hermes_audit_log (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     draft_id    UUID REFERENCES hermes_drafts (id) ON DELETE SET NULL,
     action      hermes_audit_action NOT NULL,
@@ -93,7 +88,7 @@ CREATE TABLE IF NOT EXISTS hermes_audit_log (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS hermes_sender_history (
+CREATE TABLE hermes_sender_history (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email               TEXT NOT NULL UNIQUE,
     name                TEXT,
@@ -109,14 +104,14 @@ CREATE TABLE IF NOT EXISTS hermes_sender_history (
 -- Indexes
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX IF NOT EXISTS idx_hermes_drafts_status      ON hermes_drafts (status);
-CREATE INDEX IF NOT EXISTS idx_hermes_drafts_category    ON hermes_drafts (category);
-CREATE INDEX IF NOT EXISTS idx_hermes_drafts_created_at  ON hermes_drafts (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_hermes_audit_created_at   ON hermes_audit_log (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_hermes_sender_email       ON hermes_sender_history (email);
+CREATE INDEX idx_hermes_drafts_status      ON hermes_drafts (status);
+CREATE INDEX idx_hermes_drafts_category    ON hermes_drafts (category);
+CREATE INDEX idx_hermes_drafts_created_at  ON hermes_drafts (created_at DESC);
+CREATE INDEX idx_hermes_audit_created_at   ON hermes_audit_log (created_at DESC);
+CREATE INDEX idx_hermes_sender_email       ON hermes_sender_history (email);
 
 -- ---------------------------------------------------------------------------
--- Trigger Function: updated_at
+-- Trigger: auto-update updated_at
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION hermes_update_timestamp()
@@ -129,17 +124,57 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS trg_hermes_templates_updated_at ON hermes_templates;
 CREATE TRIGGER trg_hermes_templates_updated_at
     BEFORE UPDATE ON hermes_templates
     FOR EACH ROW EXECUTE FUNCTION hermes_update_timestamp();
 
-DROP TRIGGER IF EXISTS trg_hermes_config_updated_at ON hermes_config;
 CREATE TRIGGER trg_hermes_config_updated_at
     BEFORE UPDATE ON hermes_config
     FOR EACH ROW EXECUTE FUNCTION hermes_update_timestamp();
 
-DROP TRIGGER IF EXISTS trg_hermes_sender_history_updated_at ON hermes_sender_history;
 CREATE TRIGGER trg_hermes_sender_history_updated_at
     BEFORE UPDATE ON hermes_sender_history
     FOR EACH ROW EXECUTE FUNCTION hermes_update_timestamp();
+
+-- ---------------------------------------------------------------------------
+-- Advisory Lock Helpers
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION hermes_try_lock()
+RETURNS BOOLEAN
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+    SELECT pg_try_advisory_lock(hashtext('hermes_email_cycle'));
+$$;
+
+CREATE OR REPLACE FUNCTION hermes_unlock()
+RETURNS BOOLEAN
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+    SELECT pg_advisory_unlock(hashtext('hermes_email_cycle'));
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Maintenance: Archive old drafts (strip generation_context after 90 days)
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION hermes_archive_old_drafts()
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_count INT;
+BEGIN
+    UPDATE hermes_drafts
+    SET    generation_context = NULL
+    WHERE  status IN ('sent', 'auto_sent', 'discarded', 'stale')
+      AND  created_at < now() - INTERVAL '90 days'
+      AND  generation_context IS NOT NULL;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;

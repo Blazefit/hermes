@@ -19,6 +19,20 @@ _FWD_RE = re.compile(r"^(?:fwd?|fw)\s*:\s*", re.IGNORECASE)
 # Regex to extract a bare email address from "Name <email>"
 _EMAIL_RE = re.compile(r"<([^>]+)>")
 
+# System/noreply addresses to skip when extracting original sender
+_SYSTEM_EMAIL_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"noreply@", r"no-reply@", r"donotreply@",
+        r"notifications@", r"mailer-daemon@", r"postmaster@",
+        r"@wodifymail\.com$",
+    ]
+]
+
+
+def _is_system_email(email: str) -> bool:
+    """Check if an email address is a system/noreply address."""
+    return any(p.search(email) for p in _SYSTEM_EMAIL_PATTERNS)
+
 
 # ---------------------------------------------------------------------------
 # Core fetch
@@ -136,12 +150,43 @@ def _dedup_key(msg: Dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def extract_original_sender(from_header: str, body: str) -> str:
+def extract_original_sender(from_header: str, body: str, forwarding_accounts: Optional[Set] = None) -> str:
     """Return the best-guess original sender email address.
 
-    For forwarded messages the body is searched for a ``From:`` line that
-    contains the actual originator.
+    For forwarded messages the body is searched for the actual originator.
+    Skips system/noreply addresses and uses multiple extraction patterns:
+    1. Wodify/booking: "Contact Info" + "mailto:email"
+    2. Form submissions: "Email: x@y.com"
+    3. Gmail forwarded "From:" header (skip noreply)
+    4. Any non-system email in body
+
+    Args:
+        from_header: Raw From: header value.
+        body: Email body text.
+        forwarding_accounts: Optional set of known forwarding addresses to skip.
+
+    Returns:
+        Lowercase email address of the original sender.
     """
+    skip_emails = forwarding_accounts or set()
+
+    # Pattern 1: Wodify/booking — "Contact Info" + mailto:
+    mailto_match = re.search(r"mailto:([^\s\n\r<>\"]+@[^\s\n\r<>\"]+)", body, re.IGNORECASE)
+    if mailto_match:
+        email = mailto_match.group(1).strip().lower()
+        if not _is_system_email(email) and email not in skip_emails:
+            return email
+
+    # Pattern 2: Form fields — "Email: x@y.com"
+    email_field = re.search(
+        r"(?:Email|E-mail|email address)\s*[:=]\s*([^\s<>,]+@[^\s<>,]+)", body, re.IGNORECASE
+    )
+    if email_field:
+        email = email_field.group(1).strip().lower()
+        if not _is_system_email(email) and email not in skip_emails:
+            return email
+
+    # Pattern 3: Forwarded "From:" header — skip system addresses
     fwd_from_match = re.search(
         r"(?:^|\n)[ \t]*From\s*:\s*(.+)", body, re.IGNORECASE
     )
@@ -149,10 +194,22 @@ def extract_original_sender(from_header: str, body: str) -> str:
         candidate = fwd_from_match.group(1).strip()
         email_match = _EMAIL_RE.search(candidate)
         if email_match:
-            return email_match.group(1).lower()
-        if "@" in candidate:
-            return candidate.split()[0].lower()
+            email = email_match.group(1).lower()
+            if not _is_system_email(email) and email not in skip_emails:
+                return email
+        elif "@" in candidate:
+            email = candidate.split()[0].lower()
+            if not _is_system_email(email) and email not in skip_emails:
+                return email
 
+    # Pattern 4: Any non-system email in body
+    body_emails = re.findall(r"[\w.+-]+@[\w.-]+\.\w{2,}", body)
+    for email in body_emails:
+        email = email.lower()
+        if not _is_system_email(email) and email not in skip_emails:
+            return email
+
+    # Fall back to the From: header
     email_match = _EMAIL_RE.search(from_header)
     if email_match:
         return email_match.group(1).lower()
@@ -182,17 +239,50 @@ def extract_sender_name(from_header: str) -> str:
 
 
 def extract_original_sender_name(body: str) -> str:
-    """Extract the original sender's display name from a forwarded email body."""
+    """Extract the original sender's display name from a forwarded email body.
+
+    Checks multiple patterns:
+    1. Wodify: "Contact Info" followed by name
+    2. "Name reserved a ... session" pattern
+    3. Form fields: "Name: ..."
+    4. Gmail forwarded "From: Name <email>" header (skip noreply)
+    """
+    # Pattern 1: Wodify — "Contact Info" + name on next line
+    contact_match = re.search(
+        r"Contact\s*Info\s*[\n\r]*([A-Z][a-z]+ [A-Z][a-z]+[^\n\r]*)", body
+    )
+    if contact_match:
+        name = contact_match.group(1).strip()
+        if name and "@" not in name:
+            return name
+
+    # Pattern 2: "Name reserved a ... session"
+    reserved_match = re.search(r"([A-Z][a-z]+ [A-Z][a-z]+)\s+reserved", body)
+    if reserved_match:
+        return reserved_match.group(1).strip()
+
+    # Pattern 3: Form field "Name: ..."
+    name_field = re.search(
+        r"(?:Name|Full Name|First Name)\s*[:=]\s*([^\n\r]+)", body, re.IGNORECASE
+    )
+    if name_field:
+        name = name_field.group(1).strip()
+        if name and "@" not in name:
+            return name
+
+    # Pattern 4: Gmail forwarded "From:" header — skip noreply
     fwd_from_match = re.search(
         r"(?:^|\n)[ \t]*From\s*:\s*(.+)", body, re.IGNORECASE
     )
     if fwd_from_match:
         candidate = fwd_from_match.group(1).strip()
-        angle_match = re.match(r"^(.+?)\s*<[^>]+>$", candidate)
+        angle_match = re.match(r"^(.+?)\s*<([^>]+)>$", candidate)
         if angle_match:
-            name = angle_match.group(1).strip().strip('"').strip("'")
-            if name:
-                return name
+            email = angle_match.group(2).strip()
+            if not _is_system_email(email):
+                name = angle_match.group(1).strip().strip('"').strip("'")
+                if name:
+                    return name
         if "@" not in candidate:
             return candidate
 

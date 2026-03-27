@@ -30,6 +30,12 @@ email:
       canonical: false
   # Account used for sending replies (must be one of the above)
   reply_from: "info@acmefitness.com"
+  # Known forwarding accounts — emails from these addresses are auto-forwards.
+  # Hermes will extract the original sender from the email body instead of
+  # treating the forwarder as the sender. Supports Wodify booking notifications,
+  # Gravity Forms, and standard Gmail forwarded headers.
+  forwarding_accounts:
+    - "assistant@yourbusiness.com"
 
 # --- Email Categories ---
 # Define your business-specific categories with regex patterns.
