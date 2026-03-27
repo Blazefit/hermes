@@ -1,0 +1,179 @@
+# =============================================================================
+# hermes.yaml — Hermes Email Configuration
+# =============================================================================
+# Copy this file to hermes.yaml and customize for your business.
+# Environment variables in .env override keys set here when applicable.
+
+# --- Business Identity ---
+# Used in AI system prompts and email signatures.
+business:
+  name: "Acme Fitness"
+  owner_name: "Jane Smith"
+  # Tagline used in brand voice context
+  tagline: "Your neighborhood gym since 2015"
+  # Timezone for scheduling and stale-draft calculations
+  timezone: "America/New_York"
+
+# --- Email Accounts ---
+# Each account needs a provider + connection config.
+# The first account listed is the "canonical" account for dedup.
+email:
+  provider: "maton"                # "maton" | "google" (future)
+  accounts:
+    - address: "info@acmefitness.com"
+      # Maton connection UUID (from https://ctrl.maton.ai)
+      connection_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      # Is this the primary/canonical account?
+      canonical: true
+    - address: "jane@acmefitness.com"
+      connection_id: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+      canonical: false
+  # Account used for sending replies (must be one of the above)
+  reply_from: "info@acmefitness.com"
+
+# --- Email Categories ---
+# Define your business-specific categories with regex patterns.
+# Emails not matching any pattern go to "uncategorized".
+categories:
+  inquiry:
+    patterns:
+      - "interested"
+      - "information"
+      - "how much"
+      - "pricing"
+      - "tell me more"
+    auto_send: false
+    auto_send_locked: false
+    min_confidence: 0.9
+
+  new_member:
+    patterns:
+      - "new\\s+member"
+      - "join(ing)?"
+      - "sign(ing)?\\s+up"
+      - "get(ting)?\\s+started"
+      - "membership"
+    auto_send: false
+    auto_send_locked: false
+    min_confidence: 0.9
+
+  billing:
+    patterns:
+      - "bill(ing)?"
+      - "payment"
+      - "charge[ds]?"
+      - "invoice"
+      - "cancel"
+      - "refund"
+    auto_send: false
+    # Locked = can never be auto-sent regardless of auto_send flag
+    auto_send_locked: true
+    min_confidence: 0.9
+
+  # The "uncategorized" category is always created automatically.
+  # You can configure its auto_send settings here.
+  uncategorized:
+    patterns: []
+    auto_send: false
+    auto_send_locked: true
+    min_confidence: 0.9
+
+# --- AI Settings ---
+ai:
+  # Primary model for draft generation: "anthropic" | "minimax" | "openai"
+  primary_model: "anthropic"
+  # Model for classification/extraction (cheaper/faster model)
+  classifier_model: "anthropic"
+  # Anthropic models
+  anthropic:
+    generation_model: "claude-sonnet-4-6"
+    classifier_model: "claude-haiku-4-5-20251001"
+    max_tokens_generation: 1000
+    max_tokens_classification: 256
+    temperature_generation: 0.7
+    temperature_classification: 0.1
+  # MiniMax models
+  minimax:
+    model: "MiniMax-M2.7"
+    temperature_generation: 0.7
+    temperature_classification: 0.1
+  # OpenAI models
+  openai:
+    generation_model: "gpt-4o"
+    classifier_model: "gpt-4o-mini"
+    max_tokens_generation: 1000
+    max_tokens_classification: 256
+    temperature_generation: 0.7
+    temperature_classification: 0.1
+
+# --- Brand Voice ---
+# Path to a markdown file describing your brand voice and tone.
+# Used in the AI system prompt for draft generation.
+brand_voice_file: "brand-voice.md"
+
+# --- Templates ---
+# Directory containing per-category template markdown files.
+# File names should match category keys (e.g., inquiry.md, billing.md).
+templates_dir: "templates"
+
+# --- Validation ---
+validation:
+  # Verified facts that drafts can reference (phone, address, URLs).
+  # The validator blocks drafts containing phone numbers NOT in this list.
+  verified_facts:
+    address: "123 Main St, Anytown, USA 12345"
+    phone: "(555) 123-4567"
+    website: "https://acmefitness.com"
+    schedule_url: "https://acmefitness.com/schedule"
+
+  # Words/phrases that should never appear in drafts.
+  banned_words:
+    - "crush it"
+    - "beast mode"
+    - "elite"
+    - "extreme"
+    - "cheap"
+    - "discount"
+    - "limited time offer"
+    - "act now"
+    - "don't miss out"
+    - "buy now"
+
+  # Regex patterns for financial language (blocked outside billing category).
+  financial_patterns:
+    - "\\$\\d+(?:\\.\\d{1,2})?"
+    - "\\b\\d+\\s*dollars?\\b"
+    - "\\brefund\\b"
+    - "\\bcredit\\b"
+    - "\\bwaive\\b"
+    - "\\bcomplimentary\\b"
+    - "\\bfree\\s+month\\b"
+    - "\\bdiscount\\s+\\d+\\s*%"
+
+  # Patterns for unauthorized financial commitments (blocked in billing).
+  unauthorized_commitments:
+    - "\\bI'?ll\\s+refund\\b"
+    - "\\bI'?ll\\s+credit\\b"
+    - "\\bI'?ll\\s+waive\\b"
+    - "\\bI'?ll\\s+adjust\\b"
+
+  # Valid phone patterns (regex) — any phone in a draft must match one.
+  valid_phone_patterns:
+    - "\\(555\\)\\s*123[\\s-]?4567"
+
+# --- Processing Limits ---
+processing:
+  max_emails_per_cycle: 20
+  classification_confidence_threshold: 0.8
+  auto_send_confidence_threshold: 0.9
+  stale_draft_hours: 48
+
+# --- Scheduler ---
+# Configuration for automated cycle scheduling.
+scheduler:
+  # "launchd" (macOS) or "cron" (Linux)
+  type: "launchd"
+  # How often to run, in minutes
+  interval_minutes: 15
+  # Label for launchd plist / cron comment
+  label: "com.hermes.email-cycle"
